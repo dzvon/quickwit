@@ -56,7 +56,9 @@ pub use universe::Universe;
 pub use self::actor::ActorContext;
 pub use self::actor_state::ActorState;
 pub use self::channel_with_priority::{QueueCapacity, RecvError, SendError};
-pub use self::mailbox::{create_mailbox, create_test_mailbox, Command, CommandOrMessage, Mailbox};
+pub use self::mailbox::{
+    create_mailbox, create_test_mailbox, Command, CommandOrMessage, Inbox, Mailbox,
+};
 
 /// Heartbeat used to verify that actors are progressing.
 ///

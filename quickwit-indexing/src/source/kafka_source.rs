@@ -118,7 +118,7 @@ pub struct KafkaSource {
 
 impl fmt::Debug for KafkaSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "KafkaSource {{ topic:{} }}", self.topic)
+        write!(f, "KafkaSource {{ topic: {} }}", self.topic)
     }
 }
 
@@ -127,7 +127,7 @@ impl KafkaSource {
     pub async fn try_new(
         params: KafkaSourceParams,
         checkpoint: SourceCheckpoint,
-    ) -> anyhow::Result<KafkaSource> {
+    ) -> anyhow::Result<Self> {
         let topic = params.topic;
         let consumer = create_consumer(params.client_log_level, params.client_params)?;
         let partition_ids = fetch_partition_ids(consumer.clone(), &topic).await?;
@@ -216,7 +216,7 @@ impl Source for KafkaSource {
                 .get(&message.partition())
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "Received unexpected message from partition `{}`. Assigned partitions: \
+                        "Received message from unassigned partition `{}`. Assigned partitions: \
                          `{{{}}}`.",
                         message.partition(),
                         self.state.assigned_partition_ids.keys().join(", "),

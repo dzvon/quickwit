@@ -23,14 +23,17 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use quickwit_actors::{Actor, ActorContext, ActorExitStatus, AsyncActor, Mailbox};
+use quickwit_actors::{Actor, ActorContext, ActorExitStatus, ActorHandle, AsyncActor, Mailbox};
 use rusoto_kinesis::{Kinesis, Record};
 use serde_json::json;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use crate::source::kinesis::api::{get_records, get_shard_iterator};
+use crate::source::SourceContext;
 
 #[derive(Debug)]
-enum ShardConsumerMessage {
+pub(super) enum ShardConsumerMessage {
     /// The shard was the subject of a merge or a split and points to one (merge) or two (split)
     /// children.
     ChildShards(Vec<String>),
@@ -47,7 +50,7 @@ enum ShardConsumerMessage {
 }
 
 #[derive(Default)]
-struct ShardConsumerState {
+pub(super) struct ShardConsumerState {
     /// The sequence number of the last record transferred.
     current_sequence_number: Option<String>,
     /// The number of milliseconds the last `GetRecords` response is from the tip of the stream.
@@ -60,7 +63,7 @@ struct ShardConsumerState {
     next_shard_iterator: Option<String>,
 }
 
-struct ShardConsumer {
+pub(super) struct ShardConsumer {
     stream_name: String,
     shard_id: String,
     /// Sequence number of the last record processed. Consumption of the shard is resumed right
@@ -71,17 +74,17 @@ struct ShardConsumer {
     eof_enabled: bool,
     state: ShardConsumerState,
     kinesis_client: Box<dyn Kinesis + Send + Sync>,
-    sink: Mailbox<ShardConsumerMessage>,
+    sink: mpsc::Sender<ShardConsumerMessage>,
 }
 
 impl ShardConsumer {
-    fn new(
+    pub fn new(
         stream_name: String,
         shard_id: String,
         from_sequence_number_exclusive: Option<String>,
         eof_enabled: bool,
         kinesis_client: Box<dyn Kinesis + Send + Sync>,
-        sink: Mailbox<ShardConsumerMessage>,
+        sink: mpsc::Sender<ShardConsumerMessage>,
     ) -> Self {
         Self {
             stream_name,
@@ -93,10 +96,39 @@ impl ShardConsumer {
             sink,
         }
     }
+
+    pub fn spawn(self, ctx: &SourceContext) -> ShardConsumerHandle {
+        let shard_id = self.shard_id.clone();
+        let (mailbox, actor_handle) = ctx
+            .spawn_actor(self)
+            .set_kill_switch(ctx.kill_switch().clone())
+            .spawn_async();
+        ShardConsumerHandle {
+            shard_id,
+            mailbox,
+            actor_handle,
+        }
+    }
+
+    async fn send_message(
+        &self,
+        ctx: &ActorContext<Self>,
+        message: ShardConsumerMessage,
+    ) -> anyhow::Result<()> {
+        let _guard = ctx.protect_zone();
+        self.sink.send(message).await?;
+        Ok(())
+    }
+}
+
+pub(super) struct ShardConsumerHandle {
+    pub shard_id: String,
+    pub mailbox: Mailbox<Loop>,
+    pub actor_handle: ActorHandle<ShardConsumer>,
 }
 
 #[derive(Debug)]
-struct Loop;
+pub(super) struct Loop;
 
 impl Actor for ShardConsumer {
     type Message = Loop;
@@ -159,7 +191,7 @@ impl AsyncActor for ShardConsumer {
                     records: response.records,
                     lag_millis: response.millis_behind_latest,
                 };
-                ctx.send_message(&self.sink, message).await?;
+                self.send_message(ctx, message).await?;
             }
             if let Some(children) = response.child_shards {
                 let shard_ids: Vec<String> = children
@@ -170,12 +202,12 @@ impl AsyncActor for ShardConsumer {
                     .collect();
                 if !shard_ids.is_empty() {
                     let message = ShardConsumerMessage::ChildShards(shard_ids);
-                    ctx.send_message(&self.sink, message).await?;
+                    self.send_message(ctx, message).await?;
                 }
             }
             if self.eof_enabled && response.millis_behind_latest == Some(0) {
                 let message = ShardConsumerMessage::ShardEOF(self.shard_id.clone());
-                ctx.send_message(&self.sink, message).await?;
+                self.send_message(ctx, message).await?;
                 return Err(ActorExitStatus::Success);
             };
             // The `GetRecords` API has a limit of 5 transactions per second. 1s / 5 + ε = 205ms.
@@ -184,13 +216,13 @@ impl AsyncActor for ShardConsumer {
             return Ok(());
         }
         let message = ShardConsumerMessage::ShardClosed(self.shard_id.clone());
-        ctx.send_message(&self.sink, message).await?;
+        self.send_message(ctx, message).await?;
         Err(ActorExitStatus::Success)
     }
 }
 
 #[cfg(all(test, feature = "kinesis-localstack-tests"))]
-mod kinesis_localstack_tests {
+mod tests {
     use quickwit_actors::{create_test_mailbox, Universe};
 
     use super::*;
@@ -199,10 +231,20 @@ mod kinesis_localstack_tests {
         make_shard_id, put_records_into_shards, setup, teardown,
     };
 
+    async fn drain_messages(
+        sink_rx: &mut mpsc::Receiver<ShardConsumerMessage>,
+    ) -> Vec<ShardConsumerMessage> {
+        let mut messages = Vec::new();
+        while let Ok(message) = sink_rx.try_recv() {
+            messages.push(message);
+        }
+        messages
+    }
+
     #[tokio::test]
     async fn test_shard_eof() -> anyhow::Result<()> {
         let universe = Universe::new();
-        let (sink, inbox) = create_test_mailbox();
+        let (sink_tx, mut sink_rx) = mpsc::channel(100);
         let (kinesis_client, stream_name) = setup("test-shard-eof", 1).await?;
         let shard_id_0 = make_shard_id(0);
         let shard_consumer = ShardConsumer::new(
@@ -211,13 +253,13 @@ mod kinesis_localstack_tests {
             None,
             true,
             Box::new(kinesis_client.clone()),
-            sink.clone(),
+            sink_tx,
         );
         let (_mailbox, handle) = universe.spawn_actor(shard_consumer).spawn_async();
         let (exit_status, exit_state) = handle.join().await;
         assert!(exit_status.is_success());
 
-        let messages = inbox.drain_available_message_for_test();
+        let messages = drain_messages(&mut sink_rx).await;
         assert_eq!(messages.len(), 1);
 
         assert!(matches!(
@@ -241,7 +283,7 @@ mod kinesis_localstack_tests {
     #[tokio::test]
     async fn test_start_at_horizon() -> anyhow::Result<()> {
         let universe = Universe::new();
-        let (sink, inbox) = create_test_mailbox();
+        let (sink_tx, mut sink_rx) = mpsc::channel(100);
         let (kinesis_client, stream_name) = setup("test-start-at-horizon", 1).await?;
         let sequence_numbers = put_records_into_shards(
             &kinesis_client,
@@ -256,13 +298,13 @@ mod kinesis_localstack_tests {
             None,
             true,
             Box::new(kinesis_client.clone()),
-            sink.clone(),
+            sink_tx,
         );
         let (_mailbox, handle) = universe.spawn_actor(shard_consumer).spawn_async();
         let (exit_status, exit_state) = handle.join().await;
         assert!(exit_status.is_success());
 
-        let messages = inbox.drain_available_message_for_test();
+        let messages = drain_messages(&mut sink_rx).await;
         assert_eq!(messages.len(), 2);
 
         assert!(matches!(
@@ -294,7 +336,7 @@ mod kinesis_localstack_tests {
     #[tokio::test]
     async fn test_start_after_sequence_number() -> anyhow::Result<()> {
         let universe = Universe::new();
-        let (sink, inbox) = create_test_mailbox();
+        let (sink_tx, mut sink_rx) = mpsc::channel(100);
         let (kinesis_client, stream_name) = setup("test-start-after-sequence-number", 1).await?;
         let sequence_numbers = put_records_into_shards(
             &kinesis_client,
@@ -313,13 +355,13 @@ mod kinesis_localstack_tests {
             from_sequence_number_exclusive,
             true,
             Box::new(kinesis_client.clone()),
-            sink.clone(),
+            sink_tx,
         );
         let (_mailbox, handle) = universe.spawn_actor(shard_consumer).spawn_async();
         let (exit_status, exit_state) = handle.join().await;
         assert!(exit_status.is_success());
 
-        let messages = inbox.drain_available_message_for_test();
+        let messages = drain_messages(&mut sink_rx).await;
         assert_eq!(messages.len(), 2);
 
         assert!(matches!(
@@ -354,7 +396,7 @@ mod kinesis_localstack_tests {
     #[tokio::test]
     async fn test_merge_shards() -> anyhow::Result<()> {
         let universe = Universe::new();
-        let (sink, inbox) = create_test_mailbox();
+        let (sink_tx, mut sink_rx) = mpsc::channel(100);
         let (kinesis_client, stream_name) = setup("test-merge-shards", 2).await?;
         let shard_id_0 = make_shard_id(0);
         let shard_id_1 = make_shard_id(1);
@@ -366,13 +408,13 @@ mod kinesis_localstack_tests {
                 None,
                 false,
                 Box::new(kinesis_client.clone()),
-                sink.clone(),
+                sink_tx.clone(),
             );
             let (_mailbox, handle) = universe.spawn_actor(shard_consumer_0).spawn_async();
             let (exit_status, _exit_state) = handle.join().await;
             assert!(exit_status.is_success());
 
-            let messages = inbox.drain_available_message_for_test();
+            let messages = drain_messages(&mut sink_rx).await;
             assert_eq!(messages.len(), 2);
 
             assert!(matches!(
@@ -391,13 +433,13 @@ mod kinesis_localstack_tests {
                 None,
                 false,
                 Box::new(kinesis_client.clone()),
-                sink.clone(),
+                sink_tx,
             );
             let (_mailbox, handle) = universe.spawn_actor(shard_consumer_1).spawn_async();
             let (exit_status, _exit_state) = handle.join().await;
             assert!(exit_status.is_success());
 
-            let messages = inbox.drain_available_message_for_test();
+            let messages = drain_messages(&mut sink_rx).await;
             assert_eq!(messages.len(), 1);
 
             assert!(matches!(
@@ -415,7 +457,7 @@ mod kinesis_localstack_tests {
     #[tokio::test]
     async fn test_split_shard() -> anyhow::Result<()> {
         let universe = Universe::new();
-        let (sink, inbox) = create_test_mailbox();
+        let (sink_tx, mut sink_rx) = mpsc::channel(100);
         let (kinesis_client, stream_name) = setup("test-split-shard", 1).await?;
         let shard_id_0 = make_shard_id(0);
         split_shard(&kinesis_client, &stream_name, &shard_id_0, "42").await?;
@@ -426,13 +468,13 @@ mod kinesis_localstack_tests {
             None,
             false,
             Box::new(kinesis_client.clone()),
-            sink.clone(),
+            sink_tx,
         );
         let (_mailbox, handle) = universe.spawn_actor(shard_consumer).spawn_async();
         let (exit_status, _exit_state) = handle.join().await;
         assert!(exit_status.is_success());
 
-        let messages = inbox.drain_available_message_for_test();
+        let messages = drain_messages(&mut sink_rx).await;
         assert_eq!(messages.len(), 2);
 
         assert!(matches!(

@@ -244,7 +244,7 @@ pub struct Inbox<Message> {
 }
 
 impl<Message: fmt::Debug> Inbox<Message> {
-    pub(crate) async fn recv_timeout(&mut self) -> Result<CommandOrMessage<Message>, RecvError> {
+    pub async fn recv_timeout(&mut self) -> Result<CommandOrMessage<Message>, RecvError> {
         self.rx.recv_timeout(crate::message_timeout()).await
     }
 
