@@ -18,7 +18,7 @@
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context};
@@ -177,8 +177,8 @@ impl IndexingServer {
     }
 
     pub fn spawn(
-        data_dir_path: PathBuf,
-        indexer_config: IndexerConfig,
+        data_dir_path: &Path,
+        indexer_config: &IndexerConfig,
         metastore: Arc<dyn Metastore>,
         storage_resolver: StorageUriResolver,
     ) -> IndexingServerClient {
@@ -488,12 +488,12 @@ mod tests {
 
         // Test `IndexingServer::spawn`.
         let temp_dir = tempfile::tempdir().unwrap();
-        let data_dir_path = temp_dir.path().to_path_buf();
+        let data_dir_path = temp_dir.path();
         let indexer_config = IndexerConfig::for_test().unwrap();
         let storage_resolver = StorageUriResolver::for_test();
         let client = IndexingServer::spawn(
-            data_dir_path.clone(),
-            indexer_config,
+            data_dir_path,
+            &indexer_config,
             metastore.clone(),
             storage_resolver.clone(),
         );

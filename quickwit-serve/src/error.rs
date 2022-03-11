@@ -17,7 +17,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-use quickwit_cluster::error::ClusterError;
+use quickwit_cluster::ClusterError;
 use quickwit_search::SearchError;
 use serde::ser::SerializeMap;
 use thiserror::Error;

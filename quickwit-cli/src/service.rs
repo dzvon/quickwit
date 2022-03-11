@@ -17,16 +17,15 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
+use std::collections::HashSet;
+use std::iter;
 use std::path::PathBuf;
 
 use anyhow::bail;
 use clap::{arg, ArgMatches, Command};
-use quickwit_common::run_checklist;
+use itertools::Itertools;
 use quickwit_common::uri::Uri;
-use quickwit_indexing::actors::IndexingServer;
-use quickwit_metastore::quickwit_metastore_uri_resolver;
-use quickwit_serve::run_searcher;
-use quickwit_storage::quickwit_storage_uri_resolver;
+use quickwit_serve::{serve_quickwit, QService};
 use quickwit_telemetry::payload::TelemetryEvent;
 use tracing::debug;
 
@@ -54,31 +53,7 @@ pub fn build_service_command<'a>() -> Command<'a> {
 pub struct ServiceCliCommand {
     pub config_uri: Uri,
     pub data_dir_path: Option<PathBuf>,
-    pub service: Option<Service>
-}
-
-#[derive(Debug, PartialEq, Eq, Copy, Clone)]
-pub enum Service {
-    Indexer,
-    Searcher
-}
-
-impl TryFrom<&str> for Service {
-    type Error = anyhow::Error;
-
-    fn try_from(service_str: &str) -> Result<Self, Self::Error> {
-        match service_str{
-            "indexer" => {
-                Ok(Service::Indexer)
-            }
-            "searcher" => {
-                Ok(Service::Searcher)
-            }
-            _ => {
-                bail!("Service `{service_str}` unknown");
-            }
-        }
-    }
+    pub services: HashSet<QService>,
 }
 
 impl ServiceCliCommand {
@@ -98,78 +73,36 @@ impl ServiceCliCommand {
             .map(Uri::try_new)
             .expect("`config` is a required arg.")?;
         let data_dir_path = matches.value_of("data-dir").map(PathBuf::from);
-        let service: Option<Service> =
-            if let Some(service_str) = matches.value_of("service") {
-                let service = Service::try_from(service_str)?;
-                Some(service)
-            } else {
-                None
-            };
+        let services: HashSet<QService> = if let Some(service_str) = matches.value_of("service") {
+            let service = QService::try_from(service_str)?;
+            iter::once(service).collect()
+        } else {
+            [QService::Indexer, QService::Searcher]
+                .into_iter()
+                .collect()
+        };
         Ok(ServiceCliCommand {
             config_uri,
             data_dir_path,
-            service
+            services,
         })
     }
 
     pub async fn execute(&self) -> anyhow::Result<()> {
         debug!(args = ?self, "run-service");
-        let service_str = self.service.map(|service| format!("{service:?}"))
-            .unwrap_or_else(|| "all".to_string());
+        let service_str = self
+            .services
+            .iter()
+            .map(|service| format!("{service:?}"))
+            .join(",");
         let telemetry_event = TelemetryEvent::RunService(service_str);
         quickwit_telemetry::send_telemetry_event(telemetry_event).await;
 
         let config = load_quickwit_config(&self.config_uri, self.data_dir_path.clone()).await?;
-        let metastore = quickwit_metastore_uri_resolver()
-            .resolve(&config.metastore_uri())
-            .await?;
-        let storage_resolver = quickwit_storage_uri_resolver().clone();
-
+        serve_quickwit(&config, &self.services).await?;
         Ok(())
-
     }
 }
-
-// async fn run_indexer_cli(args: RunIndexerArgs) -> anyhow::Result<()> {
-//     debug!(args = ?args, "run-indexer");
-//     let telemetry_event = TelemetryEvent::RunService("indexer".to_string());
-//     quickwit_telemetry::send_telemetry_event(telemetry_event).await;
-
-//     let config = load_quickwit_config(args.config_uri, args.data_dir_path).await?;
-//     let metastore = quickwit_metastore_uri_resolver()
-//         .resolve(&config.metastore_uri())
-//         .await?;
-//     let storage_resolver = quickwit_storage_uri_resolver().clone();
-//     let client = IndexingServer::spawn(
-//         config.data_dir_path,
-//         config.indexer_config,
-//         metastore,
-//         storage_resolver,
-//     );
-//     for index_id in args.index_ids {
-//         client.spawn_pipelines(index_id).await?;
-//     }
-//     let (exit_status, _) = client.join_server().await;
-//     if exit_status.is_success() {
-//         bail!(exit_status)
-//     }
-//     Ok(())
-// }
-
-// async fn run_searcher_cli(args: RunSearcherArgs) -> anyhow::Result<()> {
-//     debug!(args = ?args, "run-searcher");
-//     let telemetry_event = TelemetryEvent::RunService("searcher".to_string());
-//     quickwit_telemetry::send_telemetry_event(telemetry_event).await;
-
-//     let config = load_quickwit_config(args.config_uri, args.data_dir_path).await?;
-//     let metastore_uri_resolver = quickwit_metastore_uri_resolver();
-//     let metastore = metastore_uri_resolver
-//         .resolve(&config.metastore_uri())
-//         .await?;
-//     run_checklist(vec![("metastore", metastore.check_connectivity().await)]);
-//     run_searcher(config, metastore).await?;
-//     Ok(())
-// }
 
 #[cfg(test)]
 mod tests {
@@ -178,29 +111,7 @@ mod tests {
     use crate::cli::{build_cli, CliCommand};
 
     #[test]
-    fn test_parse_run_searcher_args() -> anyhow::Result<()> {
-        let command = build_cli().no_binary_name(true);
-        let matches = command.try_get_matches_from(vec![
-            "service",
-            "run",
-            "searcher",
-            "--config",
-            "/config.yaml",
-        ])?;
-        let command = CliCommand::parse_cli_args(&matches)?;
-        let expected_config_uri = Uri::try_new("file:///config.yaml").unwrap();
-        assert!(matches!(
-            command,
-            CliCommand::Service(ServiceCliCommand::RunSearcher(RunSearcherArgs {
-                config_uri,
-                data_dir_path: None,
-            })) if config_uri == expected_config_uri
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn test_parse_run_indexer_args() -> anyhow::Result<()> {
+    fn test_parse_service_run_ars() -> anyhow::Result<()> {
         let command = build_cli().no_binary_name(true);
         let matches = command.try_get_matches_from(vec![
             "service",
@@ -208,19 +119,42 @@ mod tests {
             "indexer",
             "--config",
             "/config.yaml",
-            "--indexes",
-            "foo",
-            "bar",
         ])?;
         let command = CliCommand::parse_cli_args(&matches)?;
         let expected_config_uri = Uri::try_new("file:///config.yaml").unwrap();
         assert!(matches!(
             command,
-            CliCommand::Service(ServiceCliCommand::RunIndexer(RunIndexerArgs {
+            CliCommand::Service(ServiceCliCommand {
                 config_uri,
                 data_dir_path: None,
-                index_ids,
-            })) if config_uri == expected_config_uri && index_ids == ["foo", "bar"]
+                services
+            })
+            if config_uri == expected_config_uri && services.is_empty()
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_service_run_indexer_only_ars() -> anyhow::Result<()> {
+        let command = build_cli().no_binary_name(true);
+        let matches = command.try_get_matches_from(vec![
+            "service",
+            "run",
+            "--service",
+            "indexer",
+            "--config",
+            "/config.yaml",
+        ])?;
+        let command = CliCommand::parse_cli_args(&matches)?;
+        let expected_config_uri = Uri::try_new("file:///config.yaml").unwrap();
+        assert!(matches!(
+            command,
+            CliCommand::Service(ServiceCliCommand {
+                config_uri,
+                data_dir_path: None,
+                services
+            })
+            if config_uri == expected_config_uri && services.len() == 1 && services.contains(&QService::Indexer)
         ));
         Ok(())
     }

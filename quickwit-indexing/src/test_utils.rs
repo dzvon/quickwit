@@ -83,8 +83,8 @@ impl TestSandbox {
         let storage_resolver = StorageUriResolver::for_test();
         let storage = storage_resolver.resolve(&index_uri)?;
         let client = IndexingServer::spawn(
-            temp_dir.path().to_path_buf(),
-            indexer_config,
+            temp_dir.path(),
+            &indexer_config,
             metastore.clone(),
             storage_resolver.clone(),
         );

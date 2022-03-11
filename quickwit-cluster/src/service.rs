@@ -17,11 +17,9 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use quickwit_proto::{
-    tonic, LeaveClusterRequest, LeaveClusterResponse, ListMembersRequest, ListMembersResponse,
+    LeaveClusterRequest, LeaveClusterResponse, ListMembersRequest, ListMembersResponse,
     Member as PMember,
 };
 
@@ -51,32 +49,14 @@ pub trait ClusterService: 'static + Send + Sync {
     ) -> Result<LeaveClusterResponse, ClusterError>;
 }
 
-/// Cluster service implementation.
-/// This is a service to check the status of the cluster and to operate the cluster.
-pub struct ClusterServiceImpl {
-    cluster: Arc<Cluster>,
-}
-
-impl ClusterServiceImpl {
-    /// Create a cluster service given a cluster.
-    pub fn new(cluster: Arc<Cluster>) -> Self {
-        ClusterServiceImpl { cluster }
-    }
-}
-
-#[tonic::async_trait]
-impl ClusterService for ClusterServiceImpl {
+#[async_trait]
+impl ClusterService for Cluster {
     /// This is the API to get the list of cluster members.
     async fn list_members(
         &self,
         _request: ListMembersRequest,
     ) -> Result<ListMembersResponse, ClusterError> {
-        let members = self
-            .cluster
-            .members()
-            .into_iter()
-            .map(PMember::from)
-            .collect();
+        let members = self.members().into_iter().map(PMember::from).collect();
         Ok(ListMembersResponse { members })
     }
 
@@ -85,7 +65,7 @@ impl ClusterService for ClusterServiceImpl {
         &self,
         _request: LeaveClusterRequest,
     ) -> Result<LeaveClusterResponse, ClusterError> {
-        self.cluster.leave().await;
+        self.leave().await;
         Ok(LeaveClusterResponse {})
     }
 }

@@ -17,15 +17,17 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::bail;
-use quickwit_config::{IndexerConfig, SourceConfig};
+use quickwit_config::{IndexerConfig, QuickwitConfig, SourceConfig};
 use quickwit_metastore::Metastore;
 use quickwit_storage::StorageUriResolver;
 
-use crate::actors::{IndexingPipeline, IndexingPipelineParams, IndexingServer};
+use crate::actors::{
+    IndexingPipeline, IndexingPipelineParams, IndexingServer, IndexingServerClient,
+};
 use crate::models::IndexingStatistics;
 pub use crate::split_store::{
     get_tantivy_directory_from_split_bundle, IndexingSplitStore, IndexingSplitStoreParams,
@@ -44,18 +46,18 @@ mod test_utils;
 pub use test_utils::{mock_split, mock_split_meta, TestSandbox};
 
 pub use self::garbage_collection::{delete_splits_with_files, run_garbage_collect, FileEntry};
-pub use self::merge_policy::{MergePolicy, StableMultitenantWithTimestampMergePolicy};
+use self::merge_policy::{MergePolicy, StableMultitenantWithTimestampMergePolicy};
 pub use self::source::check_source_connectivity;
 
 pub async fn index_data(
     index_id: String,
-    data_dir_path: PathBuf,
-    indexer_config: IndexerConfig,
+    data_dir_path: &Path,
+    indexer_config: &IndexerConfig,
     source: SourceConfig,
     metastore: Arc<dyn Metastore>,
     storage_resolver: StorageUriResolver,
 ) -> anyhow::Result<IndexingStatistics> {
-    let client = IndexingServer::spawn(data_dir_path, indexer_config, metastore, storage_resolver);
+    let client = IndexingServer::spawn(data_dir_path, &indexer_config, metastore, storage_resolver);
     let pipeline_id = client.spawn_pipeline(index_id, source).await?;
     let pipeline_handle = client.detach_pipeline(&pipeline_id).await?;
     let (exit_status, statistics) = pipeline_handle.join().await;
@@ -67,4 +69,25 @@ pub async fn index_data(
 
 pub fn new_split_id() -> String {
     ulid::Ulid::new().to_string()
+}
+
+pub async fn start_indexer_service(
+    config: &QuickwitConfig,
+    metastore: Arc<dyn Metastore>,
+    storage_uri_resolver: StorageUriResolver,
+) -> anyhow::Result<IndexingServerClient> {
+    let client = IndexingServer::spawn(
+        &config.data_dir_path,
+        &config.indexer_config,
+        metastore,
+        storage_uri_resolver,
+    );
+    // for index_id in args.index_ids {
+    //     client.spawn_pipelines(index_id).await?;
+    // }
+    Ok(client)
+    // let (exit_status, _) = client.join_server().await;
+    // if exit_status.is_success() {
+    //     bail!(exit_status)
+    // }
 }

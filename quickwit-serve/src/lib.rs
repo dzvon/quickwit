@@ -21,77 +21,104 @@ mod args;
 mod counters;
 mod error;
 mod format;
+
 mod grpc;
+mod rest;
 
 mod cluster_api;
 mod health_check_api;
 mod search_api;
 
-mod rest;
-
+use std::collections::HashSet;
 use std::sync::Arc;
 
+use anyhow::bail;
 use format::Format;
-use quickwit_cluster::cluster::Cluster;
-use quickwit_cluster::service::ClusterServiceImpl;
-use quickwit_config::{QuickwitConfig, SEARCHER_CONFIG_INSTANCE};
-use quickwit_metastore::Metastore;
-use quickwit_search::{ClusterClient, SearchClientPool, SearchService, SearchServiceImpl};
+use quickwit_cluster::ClusterService;
+use quickwit_config::QuickwitConfig;
+use quickwit_indexing::actors::IndexingServerClient;
+use quickwit_indexing::start_indexer_service;
+use quickwit_metastore::quickwit_metastore_uri_resolver;
+use quickwit_search::{start_searcher_service, SearchService};
 use quickwit_storage::quickwit_storage_uri_resolver;
-use tracing::{debug, info};
 
 pub use crate::args::ServeArgs;
-use crate::cluster_api::GrpcClusterAdapter;
 pub use crate::counters::COUNTERS;
-use crate::grpc::start_grpc_service;
 #[cfg(test)]
 use crate::rest::recover_fn;
-use crate::rest::start_rest_service;
-use crate::search_api::GrpcSearchAdapter;
 
-/// Starts a search node, aka a `searcher`.
-pub async fn run_searcher(
-    quickwit_config: QuickwitConfig,
-    metastore: Arc<dyn Metastore>,
-) -> anyhow::Result<()> {
-    SEARCHER_CONFIG_INSTANCE
-        .set(quickwit_config.searcher_config.clone())
-        .expect("could not set searcher config in global once cell");
-    let cluster = Arc::new(Cluster::new(
-        quickwit_config.node_id.clone(),
-        quickwit_config.gossip_socket_addr()?,
-    )?);
-    for seed_socket_addr in quickwit_config.seed_socket_addrs()? {
-        // If the peer seed address is specified,
-        // it joins the cluster in which that node participates.
-        debug!(peer_seed_addr = %seed_socket_addr, "Add peer seed node.");
-        cluster.add_peer_node(seed_socket_addr).await;
+#[derive(Debug, PartialEq, Eq, Copy, Hash, Clone)]
+pub enum QService {
+    Indexer,
+    Searcher,
+}
+
+impl TryFrom<&str> for QService {
+    type Error = anyhow::Error;
+
+    fn try_from(service_str: &str) -> Result<Self, Self::Error> {
+        match service_str {
+            "indexer" => Ok(QService::Indexer),
+            "searcher" => Ok(QService::Searcher),
+            _ => {
+                bail!("Service `{service_str}` unknown");
+            }
+        }
     }
-    let storage_uri_resolver = quickwit_storage_uri_resolver().clone();
-    let client_pool = SearchClientPool::create_and_keep_updated(cluster.clone()).await;
-    let cluster_client = ClusterClient::new(client_pool.clone());
-    let search_service = Arc::new(SearchServiceImpl::new(
-        metastore,
-        storage_uri_resolver,
-        cluster_client,
-        client_pool,
-    ));
+}
+struct QuickwitServices {
+    pub cluster_service: Arc<dyn ClusterService>,
+    pub search_service: Option<Arc<dyn SearchService>>,
+    pub indexer_service: Option<Arc<IndexingServerClient>>,
+}
 
-    let cluster_service = Arc::new(ClusterServiceImpl::new(cluster.clone()));
+pub async fn serve_quickwit(
+    config: &QuickwitConfig,
+    services: &HashSet<QService>,
+) -> anyhow::Result<()> {
+    let metastore = quickwit_metastore_uri_resolver()
+        .resolve(&config.metastore_uri())
+        .await?;
+    let storage_resolver = quickwit_storage_uri_resolver().clone();
 
-    let grpc_addr = quickwit_config.grpc_socket_addr()?;
-    let grpc_search_service =
-        GrpcSearchAdapter::from(search_service.clone() as Arc<dyn SearchService>);
-    let grpc_cluster_service = GrpcClusterAdapter::from(cluster_service.clone());
-    let grpc_server = start_grpc_service(grpc_addr, grpc_search_service, grpc_cluster_service);
+    let cluster_service = quickwit_cluster::start_cluster_service(&config).await?;
 
-    let rest_socket_addr = quickwit_config.rest_socket_addr()?;
-    let rest_server = start_rest_service(rest_socket_addr, search_service, cluster_service);
-    info!(
-        "Searcher ready to accept requests at http://{}/",
-        rest_socket_addr
-    );
+    let indexer_service: Option<Arc<IndexingServerClient>> =
+        if services.contains(&QService::Indexer) {
+            let indexer_service =
+                start_indexer_service(&config, metastore.clone(), storage_resolver.clone()).await?;
+            Some(Arc::new(indexer_service))
+        } else {
+            None
+        };
+
+    let search_service: Option<Arc<dyn SearchService>> = if services.contains(&QService::Searcher) {
+        let search_service = start_searcher_service(
+            &config,
+            metastore.clone(),
+            storage_resolver,
+            cluster_service.clone(),
+        )
+        .await?;
+        Some(search_service)
+    } else {
+        None
+    };
+
+    let quickwit_services = QuickwitServices {
+        cluster_service,
+        search_service,
+        indexer_service,
+    };
+
+    let rest_addr = config.rest_socket_addr()?;
+    let grpc_addr = config.grpc_socket_addr()?;
+
+    let grpc_server = grpc::start_grpc_server(grpc_addr, &quickwit_services);
+    let rest_server = rest::start_rest_server(rest_addr, &quickwit_services);
+
     tokio::try_join!(rest_server, grpc_server)?;
+
     Ok(())
 }
 
@@ -106,11 +133,13 @@ mod tests {
     use quickwit_metastore::{IndexMetadata, MockMetastore, SplitState};
     use quickwit_proto::search_service_server::SearchServiceServer;
     use quickwit_proto::{tonic, OutputFormat};
-    use quickwit_search::{root_search_stream, MockSearchService, SearchError, SearchService};
+    use quickwit_search::{
+        root_search_stream, ClusterClient, MockSearchService, SearchClientPool, SearchError,
+        SearchService,
+    };
     use tokio_stream::wrappers::UnboundedReceiverStream;
     use tonic::transport::Server;
 
-    use super::*;
     use crate::search_api::GrpcSearchAdapter;
 
     async fn start_test_server(

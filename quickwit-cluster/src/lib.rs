@@ -17,6 +17,31 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-pub mod cluster;
-pub mod error;
-pub mod service;
+mod cluster;
+mod error;
+mod service;
+
+use std::sync::Arc;
+
+use quickwit_config::QuickwitConfig;
+use tracing::debug;
+
+pub use crate::cluster::{create_cluster_for_test, Cluster, Member};
+pub use crate::error::{ClusterError, ClusterResult};
+pub use crate::service::ClusterService;
+
+pub async fn start_cluster_service(
+    quickwit_config: &QuickwitConfig,
+) -> anyhow::Result<Arc<Cluster>> {
+    let cluster = Arc::new(Cluster::new(
+        quickwit_config.node_id.clone(),
+        quickwit_config.gossip_socket_addr()?,
+    )?);
+    for seed_socket_addr in quickwit_config.seed_socket_addrs()? {
+        // If the peer seed address is specified,
+        // it joins the cluster in which that node participates.
+        debug!(peer_seed_addr = %seed_socket_addr, "Add peer seed node.");
+        cluster.add_peer_node(seed_socket_addr).await;
+    }
+    Ok(cluster)
+}

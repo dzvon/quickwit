@@ -29,7 +29,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ".",
             "#[derive(Serialize, Deserialize)]\n#[serde(rename_all = \"camelCase\")]",
         )
-        .format(true)
         .out_dir("src/")
         .compile_with_config(
             prost_config,

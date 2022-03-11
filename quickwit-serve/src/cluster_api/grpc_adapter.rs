@@ -20,14 +20,14 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use quickwit_cluster::service::{ClusterService, ClusterServiceImpl};
+use quickwit_cluster::ClusterService;
 use quickwit_proto::{cluster_service_server as grpc, tonic};
 
 #[derive(Clone)]
 pub struct GrpcClusterAdapter(Arc<dyn ClusterService>);
 
-impl From<Arc<ClusterServiceImpl>> for GrpcClusterAdapter {
-    fn from(cluster_service_arc: Arc<ClusterServiceImpl>) -> Self {
+impl From<Arc<dyn ClusterService>> for GrpcClusterAdapter {
+    fn from(cluster_service_arc: Arc<dyn ClusterService>) -> Self {
         GrpcClusterAdapter(cluster_service_arc)
     }
 }
