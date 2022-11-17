@@ -116,7 +116,7 @@ jobs:
           toolchain: stable
           profile: minimal
 
-      - uses: Swatinem/rust-cache@v1
+      - uses: Swatinem/rust-cache@v2
 
       - name: Compile tests
         run: cargo test --no-run --locked
